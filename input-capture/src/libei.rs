@@ -1,6 +1,6 @@
 use ashpd::{
     desktop::{
-        Session,
+        PersistMode, Session,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, InputCapture, Region,
             Zones,
@@ -18,9 +18,10 @@ use reis::{
 use std::{
     cell::Cell,
     collections::HashMap,
-    io,
+    env, fs, io,
     num::NonZeroU32,
     os::unix::net::UnixStream,
+    path::PathBuf,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -155,12 +156,32 @@ async fn create_session(
     input_capture: &InputCapture,
 ) -> std::result::Result<(Session<InputCapture>, BitFlags<Capabilities>), ashpd::Error> {
     log::debug!("creating input capture session");
-    input_capture
-        .create_session(
-            None,
-            Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen,
-        )
-        .await
+
+    let capabilities = Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen;
+
+    // Try CreateSession2 + Start (version 2 API) first,
+    // fall back to legacy CreateSession for version 1 portals
+    let (session, response) = match input_capture.create_session2().await {
+        Ok(unstarted) => {
+            input_capture
+                .start(
+                    unstarted,
+                    None,
+                    capabilities,
+                    None,
+                    PersistMode::ExplicitlyRevoked,
+                )
+                .await?
+        }
+        Err(ashpd::Error::RequiresVersion(_, _)) => {
+            input_capture
+                .create_session(None, capabilities, None, PersistMode::ExplicitlyRevoked)
+                .await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    Ok((session, response.capabilities()))
 }
 
 async fn connect_to_eis(

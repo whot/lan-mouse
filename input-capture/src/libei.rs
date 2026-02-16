@@ -152,11 +152,45 @@ async fn update_barriers(
     Ok((barriers, id_map))
 }
 
+/// Get the path to the InputCapture token file
+fn get_token_file_path() -> PathBuf {
+    let cache_dir = env::var("XDG_CACHE_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = env::var("HOME").expect("HOME not set");
+            PathBuf::from(home).join(".cache")
+        });
+
+    cache_dir.join("lan-mouse").join("input-capture.token")
+}
+
+/// Read the InputCapture token from file
+fn read_token() -> Option<String> {
+    let token_path = get_token_file_path();
+    match fs::read_to_string(&token_path) {
+        Ok(token) => Some(token.trim().to_string()),
+        Err(_) => None,
+    }
+}
+
+/// Write the InputCapture token to file
+fn write_token(token: &str) -> io::Result<()> {
+    let token_path = get_token_file_path();
+    if let Some(parent) = token_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(&token_path, token)?;
+    Ok(())
+}
+
 async fn create_session(
     input_capture: &InputCapture,
 ) -> std::result::Result<(Session<InputCapture>, BitFlags<Capabilities>), ashpd::Error> {
     log::debug!("creating input capture session");
 
+    let restore_token = read_token();
     let capabilities = Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen;
 
     // Try CreateSession2 + Start (version 2 API) first,
@@ -168,18 +202,30 @@ async fn create_session(
                     unstarted,
                     None,
                     capabilities,
-                    None,
+                    restore_token.as_deref(),
                     PersistMode::ExplicitlyRevoked,
                 )
                 .await?
         }
         Err(ashpd::Error::RequiresVersion(_, _)) => {
             input_capture
-                .create_session(None, capabilities, None, PersistMode::ExplicitlyRevoked)
+                .create_session(
+                    None,
+                    capabilities,
+                    restore_token.as_deref(),
+                    PersistMode::ExplicitlyRevoked,
+                )
                 .await?
         }
         Err(e) => return Err(e),
     };
+
+    // The restore token is only valid once, we need to re-save it each time
+    if let Some(token_str) = response.restore_token() {
+        if let Err(e) = write_token(token_str) {
+            log::warn!("failed to save InputCapture token: {}", e);
+        }
+    }
 
     Ok((session, response.capabilities()))
 }

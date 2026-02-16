@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "ashpd",
     "input-capture",
     "input-emulation",
     "input-event",
@@ -8,6 +9,19 @@ members = [
     "lan-mouse-gtk",
     "lan-mouse-proto",
 ]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/feschber/lan-mouse"
+version = "0.10.0"
+authors = ["Fertilizer Eschber <feschber@users.noreply.github.com>"]
+categories = []
+keywords = []
+rust-version = "1.75"
+
+[patch.crates-io]
+ashpd = { path = "ashpd" }
 
 [package]
 name = "lan-mouse"

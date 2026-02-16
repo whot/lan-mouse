@@ -1,6 +1,7 @@
 use ashpd::{
     desktop::{
         PersistMode, Session,
+        clipboard::Clipboard,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, InputCapture, Region,
             Zones,
@@ -197,6 +198,12 @@ async fn create_session(
     // fall back to legacy CreateSession for version 1 portals
     let (session, response) = match input_capture.create_session2().await {
         Ok(unstarted) => {
+            // Enable clipboard access for this session
+            let clipboard = Clipboard::new().await?;
+            if let Err(e) = clipboard.request(&unstarted).await {
+                log::warn!("failed to request clipboard access: {}", e);
+            }
+
             input_capture
                 .start(
                     unstarted,
@@ -225,6 +232,13 @@ async fn create_session(
         if let Err(e) = write_token(token_str) {
             log::warn!("failed to save InputCapture token: {}", e);
         }
+    }
+
+    // Log clipboard status
+    if response.clipboard_enabled() {
+        log::info!("InputCapture session: clipboard access enabled");
+    } else {
+        log::debug!("InputCapture session: clipboard access not enabled");
     }
 
     Ok((session, response.capabilities()))

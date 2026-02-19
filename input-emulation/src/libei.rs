@@ -1,15 +1,20 @@
-use futures::{StreamExt, future};
+use futures::{FutureExt, Stream, StreamExt, future};
 use std::{
     env, fs, io,
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::mpsc::{self, Receiver, Sender},
+    task::JoinHandle,
+};
 
 use ashpd::desktop::{
     PersistMode, Session,
@@ -33,6 +38,12 @@ use crate::error::EmulationError;
 
 use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClipboardEvent {
+    Noop, // Unused, for the compiler so we can terminate the loop in the task
+    OwnerChanged((bool, Vec<String>)),
+}
+
 #[derive(Clone, Default)]
 struct Devices {
     pointer: Arc<RwLock<Option<(ei::Device, ei::Pointer)>>>,
@@ -50,8 +61,9 @@ pub(crate) struct LibeiEmulation {
     libei_error: Arc<AtomicBool>,
     _remote_desktop: RemoteDesktop,
     session: Arc<Session<RemoteDesktop>>,
-    clipboard: Option<Arc<Clipboard>>,
-    clipboard_task: Option<JoinHandle<()>>,
+    _clipboard: Option<Arc<Clipboard>>,
+    clipboard_task: Option<JoinHandle<Result<ClipboardEvent, EmulationError>>>,
+    clipboard_event_rx: Receiver<ClipboardEvent>,
 }
 
 /// Get the path to the RemoteDesktop token file
@@ -155,6 +167,7 @@ async fn handle_clipboard_owner_changed(
     _session: &Session<RemoteDesktop>,
     mime_types: &[String],
     session_is_owner: Option<bool>,
+    clipboard_event_tx: &Sender<ClipboardEvent>,
 ) {
     // TODO: this needs to be implemented
     let is_owner = session_is_owner.unwrap_or(false);
@@ -163,6 +176,11 @@ async fn handle_clipboard_owner_changed(
         is_owner,
         mime_types
     );
+
+    clipboard_event_tx
+        .send(ClipboardEvent::OwnerChanged((is_owner, mime_types.into())))
+        .await
+        .expect("no channel");
 }
 
 /// Called when the Clipboard portal wants the clipboard data
@@ -182,7 +200,11 @@ async fn handle_clipboard_transfer(
     );
 }
 
-async fn clipboard_event_task(clipboard: Arc<Clipboard>, session: Arc<Session<RemoteDesktop>>) {
+async fn clipboard_event_task(
+    clipboard: Arc<Clipboard>,
+    session: Arc<Session<RemoteDesktop>>,
+    clipboard_event_tx: Sender<ClipboardEvent>,
+) -> Result<ClipboardEvent, EmulationError> {
     log::debug!("starting clipboard event task");
 
     let clipboard_owner_changed = match clipboard
@@ -192,7 +214,7 @@ async fn clipboard_event_task(clipboard: Arc<Clipboard>, session: Arc<Session<Re
         Ok(stream) => stream,
         Err(e) => {
             log::warn!("failed to receive selection owner changed events: {}", e);
-            return;
+            return Err(e.into());
         }
     };
 
@@ -203,7 +225,7 @@ async fn clipboard_event_task(clipboard: Arc<Clipboard>, session: Arc<Session<Re
         Ok(stream) => stream,
         Err(e) => {
             log::warn!("failed to receive selection transfer events: {}", e);
-            return;
+            return Err(e.into());
         }
     };
 
@@ -221,6 +243,7 @@ async fn clipboard_event_task(clipboard: Arc<Clipboard>, session: Arc<Session<Re
                         &session,
                         changed.mime_types(),
                         changed.session_is_owner(),
+                        &clipboard_event_tx,
                     ).await;
                 } else {
                     log::debug!("clipboard owner changed stream ended");
@@ -245,6 +268,8 @@ async fn clipboard_event_task(clipboard: Arc<Clipboard>, session: Arc<Session<Re
     }
 
     log::debug!("clipboard event task exited");
+
+    Ok(ClipboardEvent::Noop)
 }
 
 impl LibeiEmulation {
@@ -271,10 +296,14 @@ impl LibeiEmulation {
 
         let session = Arc::new(session);
 
+        let (clipboard_event_tx, clipboard_event_rx) = mpsc::channel(1);
         let (clipboard_task, clipboard) = if let Some(clipboard_instance) = clipboard {
             let clipboard = Arc::new(clipboard_instance);
-            let task =
-                tokio::task::spawn_local(clipboard_event_task(clipboard.clone(), session.clone()));
+            let task = tokio::task::spawn_local(clipboard_event_task(
+                clipboard.clone(),
+                session.clone(),
+                clipboard_event_tx,
+            ));
             (Some(task), Some(clipboard))
         } else {
             (None, None)
@@ -289,8 +318,9 @@ impl LibeiEmulation {
             libei_error,
             _remote_desktop,
             session,
-            clipboard,
+            _clipboard: clipboard,
             clipboard_task,
+            clipboard_event_rx,
         })
     }
 }
@@ -300,6 +330,27 @@ impl Drop for LibeiEmulation {
         self.ei_task.abort();
         if let Some(task) = &self.clipboard_task {
             task.abort();
+        }
+    }
+}
+
+impl Stream for LibeiEmulation {
+    type Item = Result<ClipboardEvent, EmulationError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(clipboard_task) = self.clipboard_task.as_mut() {
+            match clipboard_task.poll_unpin(cx) {
+                Poll::Ready(r) => match r.expect("failed to join") {
+                    Ok(event) => Poll::Ready(Some(Ok(event))),
+                    Err(e) => Poll::Ready(Some(Err(e))),
+                },
+                Poll::Pending => self
+                    .clipboard_event_rx
+                    .poll_recv(cx)
+                    .map(|e| e.map(Result::Ok)),
+            }
+        } else {
+            Poll::Ready(None)
         }
     }
 }

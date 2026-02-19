@@ -7,10 +7,17 @@ use std::{
 };
 use thiserror::Error;
 
+/// Max length of a mime type string in bytes
+pub const MAX_MIME_TYPE_LEN: usize = 64;
+
+/// MAx clipboard data chunk size in bytes
+pub const MAX_CLIPBOARD_CHUNK_SIZE: usize = 256;
+
 /// defines the maximum size an encoded event can take up
-/// this is currently the pointer motion event
-/// type: u8, time: u32, dx: f64, dy: f64
-pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+/// this is currently the clipboard data event
+/// type: u8, serial: u32, offset: u32, data_len: u8, data: [u8;256]
+pub const MAX_EVENT_SIZE: usize =
+    size_of::<u8>() + size_of::<u32>() * 2 + size_of::<u8>() + MAX_CLIPBOARD_CHUNK_SIZE;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -45,6 +52,99 @@ impl Display for Position {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ClipboardEvent {
+    /// Notify a client that clipboard content is available with the given mime type.
+    ///
+    /// This event is sent by the owner of the clipboard context.
+    Notify {
+        /// Serial number for this clipboard notification session
+        serial: u32,
+        /// Mime type string (null-terminated)
+        mime_type: [u8; MAX_MIME_TYPE_LEN],
+    },
+    /// Signals the end of clipboard mime type notifications
+    ///
+    /// The serial number must match the previous ClipboardNotify (if any).
+    /// An empty sequence consisting of just a ClipboardNotifyDone indicates
+    /// that the clipboard content was lost.
+    NotifyDone {
+        /// Serial number of the completed notification
+        serial: u32,
+    },
+    /// Request clipboard data for a specific mime type.
+    ///
+    /// This is sent *to* the owner of the clipboard context
+    Request {
+        /// Serial number for this request
+        serial: u32,
+        /// Mime type string being requested (null-terminated)
+        mime_type: [u8; MAX_MIME_TYPE_LEN],
+    },
+    /// Clipboard data chunk - multiple events sent for large data
+    /// in response to a ClipboardRequest
+    ///
+    /// The serial must match the ClipboardRequest serial.
+    ///
+    /// This event is sent by the owner of the clipboard context.
+    Data {
+        /// Serial number identifying this clipboard transfer
+        serial: u32,
+        /// Byte offset of this chunk in the complete data
+        offset: u32,
+        /// Number of valid bytes in the data field (1-256)
+        data_len: u8,
+        /// Clipboard data bytes for this chunk
+        data: [u8; MAX_CLIPBOARD_CHUNK_SIZE],
+    },
+    /// Signals the end of clipboard data transfer
+    ///
+    /// The serial must match the ClipboardRequest serial.
+    /// An empty sequence consisting of only ClipboardDataDone
+    /// indicates that no data for this mime type was available.
+    DataDone {
+        /// Serial number of the completed clipboard transfer
+        serial: u32,
+    },
+}
+
+impl Display for ClipboardEvent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClipboardEvent::Notify { serial, mime_type } => {
+                let mime_str = std::str::from_utf8(mime_type)
+                    .unwrap_or("<invalid>")
+                    .trim_end_matches('\0');
+                write!(f, "ClipboardNotify(serial={}, mime={})", serial, mime_str)
+            }
+            ClipboardEvent::NotifyDone { serial } => {
+                write!(f, "ClipboardNotifyDone(serial={})", serial)
+            }
+            ClipboardEvent::Request { serial, mime_type } => {
+                let mime_str = std::str::from_utf8(mime_type)
+                    .unwrap_or("<invalid>")
+                    .trim_end_matches('\0');
+                write!(f, "ClipboardRequest(serial={}, mime={})", serial, mime_str)
+            }
+            ClipboardEvent::Data {
+                serial,
+                offset,
+                data_len,
+                ..
+            } => {
+                write!(
+                    f,
+                    "ClipboardData(serial={}, offset={}, len={})",
+                    serial, offset, data_len
+                )
+            }
+            ClipboardEvent::DataDone { serial } => {
+                write!(f, "ClipboardDataDone(serial={})", serial)
+            }
+        }
+    }
+}
+
 /// main lan-mouse protocol event type
 #[derive(Clone, Copy, Debug)]
 pub enum ProtoEvent {
@@ -63,6 +163,8 @@ pub enum ProtoEvent {
     Ping,
     /// Response to [`ProtoEvent::Ping`], true if emulation is enabled / available
     Pong(bool),
+    /// A clipboard event
+    Clipboard(ClipboardEvent),
 }
 
 impl Display for ProtoEvent {
@@ -80,6 +182,7 @@ impl Display for ProtoEvent {
                     if *alive { "alive" } else { "not available" }
                 )
             }
+            ProtoEvent::Clipboard(e) => write!(f, "{e}"),
         }
     }
 }
@@ -98,6 +201,11 @@ pub enum EventType {
     Enter,
     Leave,
     Ack,
+    ClipboardNotify,
+    ClipboardNotifyDone,
+    ClipboardRequest,
+    ClipboardData,
+    ClipboardDataDone,
 }
 
 impl ProtoEvent {
@@ -120,6 +228,13 @@ impl ProtoEvent {
             ProtoEvent::Enter(_) => EventType::Enter,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
+            ProtoEvent::Clipboard(e) => match e {
+                ClipboardEvent::Notify { .. } => EventType::ClipboardNotify,
+                ClipboardEvent::NotifyDone { .. } => EventType::ClipboardNotifyDone,
+                ClipboardEvent::Request { .. } => EventType::ClipboardRequest,
+                ClipboardEvent::Data { .. } => EventType::ClipboardData,
+                ClipboardEvent::DataDone { .. } => EventType::ClipboardDataDone,
+            },
         }
     }
 }
@@ -174,6 +289,42 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
+            EventType::ClipboardNotify => {
+                let serial = decode_u32(&mut buf)?;
+                let mime_type = decode_bytes::<MAX_MIME_TYPE_LEN>(&mut buf)?;
+                Ok(Self::Clipboard(ClipboardEvent::Notify {
+                    serial,
+                    mime_type,
+                }))
+            }
+            EventType::ClipboardNotifyDone => {
+                let serial = decode_u32(&mut buf)?;
+                Ok(Self::Clipboard(ClipboardEvent::NotifyDone { serial }))
+            }
+            EventType::ClipboardRequest => {
+                let serial = decode_u32(&mut buf)?;
+                let mime_type = decode_bytes::<MAX_MIME_TYPE_LEN>(&mut buf)?;
+                Ok(Self::Clipboard(ClipboardEvent::Request {
+                    serial,
+                    mime_type,
+                }))
+            }
+            EventType::ClipboardData => {
+                let serial = decode_u32(&mut buf)?;
+                let offset = decode_u32(&mut buf)?;
+                let data_len = decode_u8(&mut buf)?;
+                let data = decode_bytes::<MAX_CLIPBOARD_CHUNK_SIZE>(&mut buf)?;
+                Ok(Self::Clipboard(ClipboardEvent::Data {
+                    serial,
+                    offset,
+                    data_len,
+                    data,
+                }))
+            }
+            EventType::ClipboardDataDone => {
+                let serial = decode_u32(&mut buf)?;
+                Ok(Self::Clipboard(ClipboardEvent::DataDone { serial }))
+            }
         }
     }
 }
@@ -238,6 +389,33 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
+                ProtoEvent::Clipboard(event) => match event {
+                    ClipboardEvent::Notify { serial, mime_type } => {
+                        encode_u32(buf, len, serial);
+                        encode_bytes(buf, len, &mime_type);
+                    }
+                    ClipboardEvent::NotifyDone { serial } => {
+                        encode_u32(buf, len, serial);
+                    }
+                    ClipboardEvent::Request { serial, mime_type } => {
+                        encode_u32(buf, len, serial);
+                        encode_bytes(buf, len, &mime_type);
+                    }
+                    ClipboardEvent::Data {
+                        serial,
+                        offset,
+                        data_len,
+                        data,
+                    } => {
+                        encode_u32(buf, len, serial);
+                        encode_u32(buf, len, offset);
+                        encode_u8(buf, len, data_len);
+                        encode_bytes(buf, len, &data);
+                    }
+                    ClipboardEvent::DataDone { serial } => {
+                        encode_u32(buf, len, serial);
+                    }
+                },
             }
         }
         (buf, len)
@@ -261,6 +439,14 @@ decode_impl!(u32);
 decode_impl!(i32);
 decode_impl!(f64);
 
+fn decode_bytes<const N: usize>(data: &mut &[u8]) -> Result<[u8; N], ProtocolError> {
+    let (bytes, rest) = data.split_at(N);
+    *data = rest;
+    let mut result = [0u8; N];
+    result.copy_from_slice(bytes);
+    Ok(result)
+}
+
 macro_rules! encode_impl {
     ($t:ty) => {
         paste! {
@@ -280,3 +466,11 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+fn encode_bytes<const N: usize>(buf: &mut &mut [u8], amt: &mut usize, bytes: &[u8; N]) {
+    let data = std::mem::take(buf);
+    let (dest, rest) = data.split_at_mut(N);
+    dest.copy_from_slice(bytes);
+    *amt += N;
+    *buf = rest;
+}

@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use ashpd::desktop::{
     PersistMode, Session,
+    clipboard::Clipboard,
     remote_desktop::{DeviceType, RemoteDesktop},
 };
 use async_trait::async_trait;
@@ -48,7 +49,9 @@ pub(crate) struct LibeiEmulation {
     error: Arc<Mutex<Option<EmulationError>>>,
     libei_error: Arc<AtomicBool>,
     _remote_desktop: RemoteDesktop,
-    session: Session<RemoteDesktop>,
+    session: Arc<Session<RemoteDesktop>>,
+    clipboard: Option<Arc<Clipboard>>,
+    clipboard_task: Option<JoinHandle<()>>,
 }
 
 /// Get the path to the RemoteDesktop token file
@@ -84,7 +87,15 @@ fn write_token(token: &str) -> io::Result<()> {
     Ok(())
 }
 
-async fn get_ei_fd<'a>() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
+async fn get_ei_fd<'a>() -> Result<
+    (
+        RemoteDesktop,
+        Session<RemoteDesktop>,
+        Option<Clipboard>,
+        OwnedFd,
+    ),
+    ashpd::Error,
+> {
     let remote_desktop = RemoteDesktop::new().await?;
 
     let restore_token = read_token();
@@ -102,8 +113,27 @@ async fn get_ei_fd<'a>() -> Result<(RemoteDesktop, Session<RemoteDesktop>, Owned
         )
         .await?;
 
+    let clipboard = if remote_desktop.version() >= 2 {
+        let clipboard = Clipboard::new().await?;
+        if let Err(e) = clipboard.request(&session).await {
+            log::warn!("failed to request clipboard access: {}", e);
+            None
+        } else {
+            Some(clipboard)
+        }
+    } else {
+        None
+    };
+
     log::info!("requesting permission for input emulation");
     let start_response = remote_desktop.start(&session, None).await?.response()?;
+
+    let clipboard = if start_response.clipboard_enabled() {
+        clipboard
+    } else {
+        log::warn!("RemoteDesktop session: clipboard access disabled");
+        None
+    };
 
     // The restore token is only valid once, we need to re-save it each time
     if let Some(token_str) = start_response.restore_token() {
@@ -113,12 +143,113 @@ async fn get_ei_fd<'a>() -> Result<(RemoteDesktop, Session<RemoteDesktop>, Owned
     }
 
     let fd = remote_desktop.connect_to_eis(&session).await?;
-    Ok((remote_desktop, session, fd))
+    Ok((remote_desktop, session, clipboard, fd))
+}
+
+/// Called when the Clipboard portal tells us we have a new
+/// selection owner and a set of mime types.
+///
+/// Note: this will also be called when *we* are the selection owner.
+async fn handle_clipboard_owner_changed(
+    _clipboard: &Clipboard,
+    _session: &Session<RemoteDesktop>,
+    mime_types: &[String],
+    session_is_owner: Option<bool>,
+) {
+    // TODO: this needs to be implemented
+    let is_owner = session_is_owner.unwrap_or(false);
+    log::debug!(
+        "RemoteDesktop clipboard owner changed - is_owner: {}, mime_types: {:?}",
+        is_owner,
+        mime_types
+    );
+}
+
+/// Called when the Clipboard portal wants the clipboard data
+/// for a given mime type. Only called if we have previously
+/// become the selection owner.
+async fn handle_clipboard_transfer(
+    _clipboard: &Clipboard,
+    _session: &Session<RemoteDesktop>,
+    mime_type: String,
+    serial: u32,
+) {
+    // TODO: this needs to be implemented
+    log::debug!(
+        "RemoteDesktop clipboard transfer - mime_type: {}, serial: {}",
+        mime_type,
+        serial
+    );
+}
+
+async fn clipboard_event_task(clipboard: Arc<Clipboard>, session: Arc<Session<RemoteDesktop>>) {
+    log::debug!("starting clipboard event task");
+
+    let clipboard_owner_changed = match clipboard
+        .receive_selection_owner_changed::<RemoteDesktop>()
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            log::warn!("failed to receive selection owner changed events: {}", e);
+            return;
+        }
+    };
+
+    let clipboard_transfer = match clipboard
+        .receive_selection_transfer::<RemoteDesktop>()
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            log::warn!("failed to receive selection transfer events: {}", e);
+            return;
+        }
+    };
+
+    tokio::pin!(clipboard_owner_changed);
+    tokio::pin!(clipboard_transfer);
+
+    loop {
+        tokio::select! {
+            owner_changed = clipboard_owner_changed.next() => {
+                if let Some((_event_session, changed)) = owner_changed {
+                    // Note: We ignore the _event_session and use our main session because
+                    // they're supposed to be the same anyway
+                    handle_clipboard_owner_changed(
+                        &clipboard,
+                        &session,
+                        changed.mime_types(),
+                        changed.session_is_owner(),
+                    ).await;
+                } else {
+                    log::debug!("clipboard owner changed stream ended");
+                    break;
+                }
+            },
+            transfer = clipboard_transfer.next() => {
+                if let Some((transfer_session, mime_type, serial)) = transfer {
+                    // Use the transfer session for writing
+                    handle_clipboard_transfer(
+                        &clipboard,
+                        &transfer_session,
+                        mime_type,
+                        serial,
+                    ).await;
+                } else {
+                    log::debug!("clipboard transfer stream ended");
+                    break;
+                }
+            },
+        }
+    }
+
+    log::debug!("clipboard event task exited");
 }
 
 impl LibeiEmulation {
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
-        let (_remote_desktop, session, eifd) = get_ei_fd().await?;
+        let (_remote_desktop, session, clipboard, eifd) = get_ei_fd().await?;
         let stream = UnixStream::from(eifd);
         stream.set_nonblocking(true)?;
         let context = ei::Context::new(stream)?;
@@ -138,6 +269,17 @@ impl LibeiEmulation {
         );
         let ei_task = tokio::task::spawn_local(ei_handler);
 
+        let session = Arc::new(session);
+
+        let (clipboard_task, clipboard) = if let Some(clipboard_instance) = clipboard {
+            let clipboard = Arc::new(clipboard_instance);
+            let task =
+                tokio::task::spawn_local(clipboard_event_task(clipboard.clone(), session.clone()));
+            (Some(task), Some(clipboard))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             context,
             conn,
@@ -147,6 +289,8 @@ impl LibeiEmulation {
             libei_error,
             _remote_desktop,
             session,
+            clipboard,
+            clipboard_task,
         })
     }
 }
@@ -154,6 +298,9 @@ impl LibeiEmulation {
 impl Drop for LibeiEmulation {
     fn drop(&mut self) {
         self.ei_task.abort();
+        if let Some(task) = &self.clipboard_task {
+            task.abort();
+        }
     }
 }
 

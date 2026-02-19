@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use input_event::Event;
+use input_event::{ClipboardEvent, Event};
 
 use crate::error::EmulationError;
 
@@ -19,6 +19,14 @@ impl Emulation for DummyEmulation {
     async fn consume(
         &mut self,
         event: Event,
+        client_handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        log::info!("received event: ({client_handle}) {event}");
+        Ok(())
+    }
+    async fn consume_clipboard(
+        &mut self,
+        event: ClipboardEvent,
         client_handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         log::info!("received event: ({client_handle}) {event}");

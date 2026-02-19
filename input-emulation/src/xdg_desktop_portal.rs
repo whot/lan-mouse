@@ -128,6 +128,14 @@ impl Emulation for DesktopPortalEmulation {
         }
         Ok(())
     }
+    async fn consume_clipboard(
+        &mut self,
+        _event: input_event::ClipboardEvent,
+        _client: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        // FIXME:
+        Ok(())
+    }
 
     async fn create(&mut self, _client: EmulationHandle) {}
     async fn destroy(&mut self, _client: EmulationHandle) {}

@@ -1,7 +1,11 @@
 use futures::{FutureExt, Stream, StreamExt, future};
 use std::{
+    collections::HashMap,
     env, fs, io,
-    os::{fd::OwnedFd, unix::net::UnixStream},
+    os::{
+        fd::{FromRawFd, IntoRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -12,6 +16,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
@@ -42,6 +47,7 @@ use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
 pub enum ClipboardEvent {
     Noop, // Unused, for the compiler so we can terminate the loop in the task
     OwnerChanged((bool, Vec<String>)),
+    TransferRequest((u32, String)),
 }
 
 #[derive(Clone, Default)]
@@ -61,9 +67,13 @@ pub(crate) struct LibeiEmulation {
     libei_error: Arc<AtomicBool>,
     _remote_desktop: RemoteDesktop,
     session: Arc<Session<RemoteDesktop>>,
-    _clipboard: Option<Arc<Clipboard>>,
+    clipboard: Option<Arc<Clipboard>>,
     clipboard_task: Option<JoinHandle<Result<ClipboardEvent, EmulationError>>>,
     clipboard_event_rx: Receiver<ClipboardEvent>,
+
+    clipboard_transfer_serial: Option<u32>,
+    clipboard_incoming_mime_types: HashMap<u32, Vec<String>>,
+    clipboard_incoming_data: Option<(u32, Vec<u8>)>,
 }
 
 /// Get the path to the RemoteDesktop token file
@@ -191,6 +201,7 @@ async fn handle_clipboard_transfer(
     _session: &Session<RemoteDesktop>,
     mime_type: String,
     serial: u32,
+    clipboard_event_tx: &Sender<ClipboardEvent>,
 ) {
     // TODO: this needs to be implemented
     log::debug!(
@@ -198,6 +209,11 @@ async fn handle_clipboard_transfer(
         mime_type,
         serial
     );
+
+    clipboard_event_tx
+        .send(ClipboardEvent::TransferRequest((serial, mime_type)))
+        .await
+        .expect("no channel");
 }
 
 async fn clipboard_event_task(
@@ -258,6 +274,7 @@ async fn clipboard_event_task(
                         &transfer_session,
                         mime_type,
                         serial,
+                        &clipboard_event_tx,
                     ).await;
                 } else {
                     log::debug!("clipboard transfer stream ended");
@@ -318,9 +335,13 @@ impl LibeiEmulation {
             libei_error,
             _remote_desktop,
             session,
-            _clipboard: clipboard,
+            clipboard,
             clipboard_task,
             clipboard_event_rx,
+
+            clipboard_transfer_serial: None,
+            clipboard_incoming_mime_types: HashMap::new(),
+            clipboard_incoming_data: None,
         })
     }
 }
@@ -450,6 +471,139 @@ impl Emulation for LibeiEmulation {
         Ok(())
     }
 
+    async fn consume_clipboard(
+        &mut self,
+        event: input_event::ClipboardEvent,
+        _handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        log::info!("............ clipboard event {event}");
+        if let Some(clipboard) = &mut self.clipboard {
+            match event {
+                input_event::ClipboardEvent::Notify { serial, mime_type } => {
+                    // Store incoming mime types until the NotifyDone event
+                    if let Ok(mime_type) = String::from_utf8(mime_type.into()) {
+                        self.clipboard_incoming_mime_types
+                            .entry(serial)
+                            .or_insert_with(Vec::new)
+                            .push(mime_type);
+                    } else {
+                        log::warn!("Invalid mime type {:?}", mime_type);
+                    }
+                }
+                input_event::ClipboardEvent::NotifyDone { serial } => {
+                    // Notify our Clipboard session that we're now the selection
+                    // owner.
+                    if let Some(mime_types) = self.clipboard_incoming_mime_types.get(&serial) {
+                        let mime_types_slice: Vec<&str> =
+                            mime_types.iter().map(|s| s.as_str()).collect();
+                        clipboard
+                            .set_selection(&self.session, &mime_types_slice)
+                            .await?;
+                    }
+                    self.clipboard_incoming_mime_types.remove(&serial);
+                }
+                input_event::ClipboardEvent::Request { serial, mime_type } => {
+                    if let Ok(mime_type) = String::from_utf8(mime_type.into()) {
+                        match clipboard.selection_read(&self.session, &mime_type).await {
+                            Ok(fd) => {
+                                match read_clipboard_data(fd).await {
+                                    Ok(data) => {
+                                        // FIXME: need to send this back via the protocol
+                                        // somehow
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "failed to read clipboard data for {}: {}",
+                                            mime_type,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "failed to read clipboard data for {}: {}",
+                                    mime_type,
+                                    e
+                                );
+                            }
+                        }
+                    } else {
+                        log::warn!("Invalid mime type {:?}", mime_type);
+                    }
+                }
+                input_event::ClipboardEvent::Data {
+                    serial,
+                    offset,
+                    data_len,
+                    data,
+                } => {
+                    if let Some((buffer_serial, buffer)) = self.clipboard_incoming_data.as_mut() {
+                        if buffer_serial != &serial {
+                            log::error!(
+                                "Mismatching serial on incoming clipboard data ({serial} but have {buffer_serial})"
+                            );
+                        } else if offset as usize != buffer.len() {
+                            log::error!(
+                                "Mismatching offset on incoming clipboard data ({offset} but have {}",
+                                buffer.len()
+                            );
+                        } else {
+                            buffer.extend_from_slice(&data[..data_len as usize])
+                        }
+                    } else {
+                        self.clipboard_incoming_data =
+                            Some((serial, data[..data_len as usize].into()));
+                    }
+                }
+                input_event::ClipboardEvent::DataDone { serial } => {
+                    if let Some((buffer_serial, buffer)) = self.clipboard_incoming_data.as_mut() {
+                        if buffer_serial != &serial {
+                            log::error!(
+                                "Mismatching serial on incoming clipboard data ({serial} but have {buffer_serial})"
+                            );
+                        } else if let Some(transfer_serial) = self.clipboard_transfer_serial {
+                            match clipboard
+                                .selection_write(&self.session, transfer_serial)
+                                .await
+                            {
+                                Ok(fd) => match write_clipboard_data(fd, &buffer).await {
+                                    Ok(_) => {
+                                        if let Err(e) = clipboard
+                                            .selection_write_done(&self.session, serial, true)
+                                            .await
+                                        {
+                                            log::warn!(
+                                                "failed to send selection_write_done: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!("failed to write clipboard data: {}", e);
+                                        if let Err(e) = clipboard
+                                            .selection_write_done(&self.session, serial, false)
+                                            .await
+                                        {
+                                            log::warn!(
+                                                "failed to send selection_write_done: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    log::warn!("Failed to get an fd for clipboard writing: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn create(&mut self, _: EmulationHandle) {}
     async fn destroy(&mut self, _: EmulationHandle) {}
 
@@ -573,4 +727,34 @@ async fn ei_event_handler(
         }
         context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
     }
+}
+
+/// Read clipboard data from a file descriptor                                      
+async fn read_clipboard_data(fd: ashpd::zvariant::OwnedFd) -> io::Result<Vec<u8>> {
+    // Convert ashpd's OwnedFd to std OwnedFd, then to std::fs::File
+    let std_fd: OwnedFd = fd.into();
+    let raw_fd = std_fd.into_raw_fd();
+    let std_file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+
+    // Wrap in a tokio::fs::File which handles async I/O
+    let mut file = tokio::fs::File::from_std(std_file);
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+    Ok(buffer)
+}
+
+/// Write clipboard data to a file descriptor                                                   
+async fn write_clipboard_data(fd: ashpd::zvariant::OwnedFd, data: &[u8]) -> io::Result<usize> {
+    // Convert ashpd's OwnedFd to std OwnedFd, then to std::fs::File
+    let std_fd: OwnedFd = fd.into();
+    let raw_fd = std_fd.into_raw_fd();
+    let std_file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+
+    // Wrap in a tokio::fs::File which handles async I/O
+    let mut file = tokio::fs::File::from_std(std_file);
+
+    file.write_all(data).await?;
+    file.flush().await?;
+    Ok(data.len())
 }

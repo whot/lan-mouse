@@ -1,7 +1,7 @@
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
-use input_event::Event;
+use input_event::{ClipboardEvent, Event};
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -150,6 +150,7 @@ impl ListenTask {
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                            ProtoEvent::Clipboard(event) => self.emulation_proxy.consume_clipboard(event, addr),
                             _ => {}
                         }
                     }
@@ -210,6 +211,7 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    Clipboard(ClipboardEvent, SocketAddr),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -255,6 +257,15 @@ impl EmulationProxy {
         if self.emulation_active.get() {
             self.request_tx
                 .send(ProxyRequest::Input(event, addr))
+                .expect("channel closed");
+        }
+    }
+
+    fn consume_clipboard(&self, event: ClipboardEvent, addr: SocketAddr) {
+        // ignore events if emulation is currently disabled
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::Clipboard(event, addr))
                 .expect("channel closed");
         }
     }
@@ -305,6 +316,7 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Clipboard(..) => { /* emulation inactive => ignore */ }
                 }
             }
         }
@@ -370,6 +382,19 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
+                    ProxyRequest::Clipboard(event, addr) => {
+                        let handle = match self.handles.get(&addr) {
+                            Some(&handle) => handle,
+                            None => {
+                                let handle = self.next_id;
+                                self.next_id += 1;
+                                emulation.create(handle).await;
+                                self.handles.insert(addr, handle);
+                                handle
+                            }
+                        };
+                        emulation.consume_clipboard(event, handle).await?;
+                    },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
@@ -399,6 +424,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::Clipboard(_, _) => continue,
         }
     }
 }

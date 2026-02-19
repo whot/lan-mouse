@@ -30,7 +30,7 @@ use wayland_client::{
     protocol::{wl_registry, wl_seat},
 };
 
-use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
+use input_event::{ClipboardEvent, Event, KeyboardEvent, PointerEvent, scancode};
 
 use super::EmulationHandle;
 use super::error::WaylandBindError;
@@ -156,6 +156,15 @@ impl Emulation for WlrootsEmulation {
                 Err(e) => Err(e)?,
             }
         }
+        Ok(())
+    }
+
+    async fn consume_clipboard(
+        &mut self,
+        _event: ClipboardEvent,
+        _client: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        // FIXME:
         Ok(())
     }
 

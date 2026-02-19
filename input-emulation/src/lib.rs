@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{ClipboardEvent, Event, KeyboardEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -153,6 +153,16 @@ impl InputEmulation {
         }
     }
 
+    pub async fn consume_clipboard(
+        &mut self,
+        event: ClipboardEvent,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        match event {
+            _ => self.emulation.consume_clipboard(event, handle).await,
+        }
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -232,6 +242,11 @@ trait Emulation: Send {
     async fn consume(
         &mut self,
         event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError>;
+    async fn consume_clipboard(
+        &mut self,
+        event: ClipboardEvent,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError>;
     async fn create(&mut self, handle: EmulationHandle);

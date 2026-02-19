@@ -6,7 +6,8 @@ use x11::{
 };
 
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, ClipboardEvent, Event, KeyboardEvent,
+    PointerEvent,
 };
 
 use crate::error::EmulationError;
@@ -136,6 +137,14 @@ impl Emulation for X11Emulation {
         unsafe {
             xlib::XFlush(self.display);
         }
+        // FIXME
+        Ok(())
+    }
+    async fn consume_clipboard(
+        &mut self,
+        _: ClipboardEvent,
+        _: EmulationHandle,
+    ) -> Result<(), EmulationError> {
         // FIXME
         Ok(())
     }

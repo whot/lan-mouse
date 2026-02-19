@@ -1,4 +1,7 @@
-use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
+use input_event::{
+    ClipboardEvent, Event as InputEvent, KeyboardEvent, MAX_CLIPBOARD_CHUNK_SIZE,
+    MAX_MIME_TYPE_LEN, PointerEvent,
+};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
@@ -6,12 +9,6 @@ use std::{
     mem::size_of,
 };
 use thiserror::Error;
-
-/// Max length of a mime type string in bytes
-pub const MAX_MIME_TYPE_LEN: usize = 64;
-
-/// MAx clipboard data chunk size in bytes
-pub const MAX_CLIPBOARD_CHUNK_SIZE: usize = 256;
 
 /// defines the maximum size an encoded event can take up
 /// this is currently the clipboard data event
@@ -49,99 +46,6 @@ impl Display for Position {
             Position::Bottom => "bottom",
         };
         write!(f, "{pos}")
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ClipboardEvent {
-    /// Notify a client that clipboard content is available with the given mime type.
-    ///
-    /// This event is sent by the owner of the clipboard context.
-    Notify {
-        /// Serial number for this clipboard notification session
-        serial: u32,
-        /// Mime type string (null-terminated)
-        mime_type: [u8; MAX_MIME_TYPE_LEN],
-    },
-    /// Signals the end of clipboard mime type notifications
-    ///
-    /// The serial number must match the previous ClipboardNotify (if any).
-    /// An empty sequence consisting of just a ClipboardNotifyDone indicates
-    /// that the clipboard content was lost.
-    NotifyDone {
-        /// Serial number of the completed notification
-        serial: u32,
-    },
-    /// Request clipboard data for a specific mime type.
-    ///
-    /// This is sent *to* the owner of the clipboard context
-    Request {
-        /// Serial number for this request
-        serial: u32,
-        /// Mime type string being requested (null-terminated)
-        mime_type: [u8; MAX_MIME_TYPE_LEN],
-    },
-    /// Clipboard data chunk - multiple events sent for large data
-    /// in response to a ClipboardRequest
-    ///
-    /// The serial must match the ClipboardRequest serial.
-    ///
-    /// This event is sent by the owner of the clipboard context.
-    Data {
-        /// Serial number identifying this clipboard transfer
-        serial: u32,
-        /// Byte offset of this chunk in the complete data
-        offset: u32,
-        /// Number of valid bytes in the data field (1-256)
-        data_len: u8,
-        /// Clipboard data bytes for this chunk
-        data: [u8; MAX_CLIPBOARD_CHUNK_SIZE],
-    },
-    /// Signals the end of clipboard data transfer
-    ///
-    /// The serial must match the ClipboardRequest serial.
-    /// An empty sequence consisting of only ClipboardDataDone
-    /// indicates that no data for this mime type was available.
-    DataDone {
-        /// Serial number of the completed clipboard transfer
-        serial: u32,
-    },
-}
-
-impl Display for ClipboardEvent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClipboardEvent::Notify { serial, mime_type } => {
-                let mime_str = std::str::from_utf8(mime_type)
-                    .unwrap_or("<invalid>")
-                    .trim_end_matches('\0');
-                write!(f, "ClipboardNotify(serial={}, mime={})", serial, mime_str)
-            }
-            ClipboardEvent::NotifyDone { serial } => {
-                write!(f, "ClipboardNotifyDone(serial={})", serial)
-            }
-            ClipboardEvent::Request { serial, mime_type } => {
-                let mime_str = std::str::from_utf8(mime_type)
-                    .unwrap_or("<invalid>")
-                    .trim_end_matches('\0');
-                write!(f, "ClipboardRequest(serial={}, mime={})", serial, mime_str)
-            }
-            ClipboardEvent::Data {
-                serial,
-                offset,
-                data_len,
-                ..
-            } => {
-                write!(
-                    f,
-                    "ClipboardData(serial={}, offset={}, len={})",
-                    serial, offset, data_len
-                )
-            }
-            ClipboardEvent::DataDone { serial } => {
-                write!(f, "ClipboardDataDone(serial={})", serial)
-            }
-        }
     }
 }
 
